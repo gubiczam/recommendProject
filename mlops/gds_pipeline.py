@@ -31,6 +31,8 @@ EMBEDDING_DIMENSION = int(os.getenv("GDS_EMBEDDING_DIMENSION", "128"))
 USER_KNN_TOP_K = int(os.getenv("USER_KNN_TOP_K", "5"))
 KNN_SIMILARITY_CUTOFF = float(os.getenv("KNN_SIMILARITY_CUTOFF", "0.0"))
 RECOMMENDATION_LIMIT = int(os.getenv("RECOMMENDATION_LIMIT", "10"))
+TRAIN_VIEWED_REL = "TRAIN_VIEWED"
+TRAIN_PURCHASED_REL = "TRAIN_PURCHASED"
 
 WEIGHT_PERSONALIZED = float(os.getenv("WEIGHT_PERSONALIZED", "0.7"))
 WEIGHT_POPULARITY = float(os.getenv("WEIGHT_POPULARITY", "0.2"))
@@ -92,10 +94,12 @@ def build_projection(tx: Any, graph_name: str) -> None:
         CALL gds.graph.project(
           $graph_name,
           ['User', 'Product'],
-          ['VIEWED', 'PURCHASED']
+          [$train_viewed_rel, $train_purchased_rel]
         )
         """,
         graph_name=graph_name,
+        train_viewed_rel=TRAIN_VIEWED_REL,
+        train_purchased_rel=TRAIN_PURCHASED_REL,
     ).consume()
 
 
@@ -151,6 +155,49 @@ def build_user_similarity_knn(tx: Any, graph_name: str) -> dict[str, Any]:
     }
 
 
+def cleanup_training_relationships(tx: Any) -> None:
+    tx.run(
+        f"MATCH ()-[r:{TRAIN_VIEWED_REL}|{TRAIN_PURCHASED_REL}]->() DELETE r"
+    ).consume()
+
+
+def materialize_training_relationships(
+    tx: Any,
+    holdout_by_user: dict[str, str | None],
+) -> dict[str, int]:
+    result = tx.run(
+        """
+        MATCH (u:User)-[r:VIEWED|PURCHASED]->(p:Product)
+        WHERE $holdout_by_user[u.id] IS NULL OR p.id <> $holdout_by_user[u.id]
+        WITH u, p, r,
+             CASE type(r)
+               WHEN 'VIEWED' THEN $train_viewed_rel
+               WHEN 'PURCHASED' THEN $train_purchased_rel
+             END AS train_rel_type
+        CALL apoc.create.relationship(
+          u,
+          train_rel_type,
+          {
+            first_event_at: r.first_event_at,
+            last_event_at: r.last_event_at,
+            count: coalesce(r.count, 1)
+          },
+          p
+        ) YIELD rel
+        RETURN count(rel) AS relationships_created
+        """,
+        holdout_by_user=holdout_by_user,
+        train_viewed_rel=TRAIN_VIEWED_REL,
+        train_purchased_rel=TRAIN_PURCHASED_REL,
+    ).single()
+    relationships_created = int(result["relationships_created"]) if result else 0
+    users_with_holdout = sum(1 for product_id in holdout_by_user.values() if product_id)
+    return {
+        "relationships_created": relationships_created,
+        "users_with_holdout": users_with_holdout,
+    }
+
+
 def fetch_holdout_map(tx: Any) -> dict[str, str | None]:
     rows = tx.run(
         """
@@ -175,17 +222,17 @@ def compute_recommendations(
         MATCH (u:User)
         WITH u, $holdout_by_user[u.id] AS holdout_product_id
         CALL (u, holdout_product_id) {
-          OPTIONAL MATCH (u)-[su:SIMILAR_USER]->(peer:User)-[r:VIEWED|PURCHASED]->(candidate:Product)
+          OPTIONAL MATCH (u)-[su:SIMILAR_USER]->(peer:User)-[r:TRAIN_VIEWED|TRAIN_PURCHASED]->(candidate:Product)
           WHERE peer <> u
             AND (
               candidate.id = holdout_product_id OR
-              NOT (u)-[:VIEWED|PURCHASED]->(candidate)
+              NOT (u)-[:TRAIN_VIEWED|TRAIN_PURCHASED]->(candidate)
             )
           WITH candidate,
-               sum((coalesce(su.score, 0.0) + 0.05) * CASE type(r) WHEN 'PURCHASED' THEN 3.0 ELSE 1.0 END) AS personalized_raw,
+               sum((coalesce(su.score, 0.0) + 0.05) * CASE type(r) WHEN 'TRAIN_PURCHASED' THEN 3.0 ELSE 1.0 END) AS personalized_raw,
                count(DISTINCT peer) AS supporting_signals
           WHERE candidate IS NOT NULL
-          OPTIONAL MATCH (candidate)<-[all_r:VIEWED|PURCHASED]-(:User)
+          OPTIONAL MATCH (candidate)<-[all_r:TRAIN_VIEWED|TRAIN_PURCHASED]-(:User)
           WITH candidate,
                supporting_signals,
                personalized_raw,
@@ -286,21 +333,29 @@ def run_train() -> dict[str, Any]:
             gds_version = session.execute_read(ensure_gds_available)
             print(f"GDS version: {gds_version}")
 
+            holdout_by_user = session.execute_read(fetch_holdout_map)
+            session.execute_write(cleanup_training_relationships)
+            training_stats = session.execute_write(
+                materialize_training_relationships,
+                holdout_by_user,
+            )
+
             session.execute_write(drop_existing_projection_if_needed, GRAPH_NAME)
             session.execute_write(build_projection, GRAPH_NAME)
             session.execute_write(run_fastrp, GRAPH_NAME)
             knn_stats = session.execute_write(build_user_similarity_knn, GRAPH_NAME)
             print(f"KNN write stats: {knn_stats}")
-
-            holdout_by_user = session.execute_read(fetch_holdout_map)
             rows = session.execute_read(compute_recommendations, holdout_by_user, RECOMMENDATION_LIMIT)
 
             session.execute_write(drop_existing_projection_if_needed, GRAPH_NAME)
+            session.execute_write(cleanup_training_relationships)
 
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "gds_graph": GRAPH_NAME,
             "k": RECOMMENDATION_LIMIT,
+            "holdout_strategy": "latest interacted product per user excluded from training graph",
+            "training_stats": training_stats,
             "weights": {
                 "personalized": WEIGHT_PERSONALIZED,
                 "popularity": WEIGHT_POPULARITY,
@@ -312,7 +367,14 @@ def run_train() -> dict[str, Any]:
         print(f"Saved candidate artifact: {CANDIDATES_PATH}")
         return payload
     finally:
-        driver.close()
+        try:
+            with driver.session() as session:
+                session.execute_write(drop_existing_projection_if_needed, GRAPH_NAME)
+                session.execute_write(cleanup_training_relationships)
+        except Exception:
+            pass
+        finally:
+            driver.close()
 
 
 def run_evaluate() -> dict[str, Any]:
